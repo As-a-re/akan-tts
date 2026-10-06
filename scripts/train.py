@@ -284,9 +284,9 @@ def main():
 
         mixed_precision=not a.fp32,
 
-        save_step=1000,
+        save_step=100,
         save_n_checkpoints=3,
-        save_best_after=1000,
+        save_best_after=100,
 
         output_path=str(out_dir),
 
