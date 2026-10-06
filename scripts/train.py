@@ -12,6 +12,7 @@ Resume an interrupted run:
   python scripts/train.py --data data/akan_ljs --out runs/akan_vits \
       --continue_path runs/akan_vits/<run_folder>
 """
+
 import argparse
 import json
 import os
@@ -32,6 +33,23 @@ from TTS.utils.audio import AudioProcessor
 from normalize import LETTERS
 
 
+def patch_json_path_serialization():
+    """Allow Python/Coqui JSON serialization of pathlib.Path objects.
+
+    Some versions of Coqui Trainer call json.dump() on configuration
+    dictionaries that contain pathlib.Path objects. Python's standard JSON
+    encoder cannot serialize Path objects by default.
+    """
+    original_default = json.JSONEncoder.default
+
+    def json_default(self, obj):
+        if isinstance(obj, Path):
+            return str(obj)
+        return original_default(self, obj)
+
+    json.JSONEncoder.default = json_default
+
+
 def get_pretrained():
     """Download the public Coqui LJSpeech VITS checkpoint and return its path."""
     from TTS.utils.manage import ModelManager
@@ -41,41 +59,166 @@ def get_pretrained():
 
 
 def validate_data(data_dir: Path):
-    required = [data_dir / "metadata_train.csv", data_dir / "metadata_val.csv", data_dir / "wavs"]
+    required = [
+        data_dir / "metadata_train.csv",
+        data_dir / "metadata_val.csv",
+        data_dir / "wavs",
+    ]
+
     missing = [str(p) for p in required if not p.exists()]
+
     if missing:
         raise FileNotFoundError(
             "Prepared dataset is incomplete. Missing: " + ", ".join(missing)
         )
 
-    train_n = sum(1 for _ in open(data_dir / "metadata_train.csv", encoding="utf-8"))
-    val_n = sum(1 for _ in open(data_dir / "metadata_val.csv", encoding="utf-8"))
+    train_n = sum(
+        1
+        for _ in open(
+            data_dir / "metadata_train.csv",
+            encoding="utf-8",
+        )
+    )
+
+    val_n = sum(
+        1
+        for _ in open(
+            data_dir / "metadata_val.csv",
+            encoding="utf-8",
+        )
+    )
+
     if train_n < 2 or val_n < 1:
-        raise ValueError(f"Dataset split is too small: train={train_n}, val={val_n}")
-    print(f"Prepared corpus: {train_n} training utterances, {val_n} validation utterances")
+        raise ValueError(
+            f"Dataset split is too small: train={train_n}, val={val_n}"
+        )
+
+    print(
+        f"Prepared corpus: {train_n} training utterances, "
+        f"{val_n} validation utterances"
+    )
+
+
+def print_environment():
+    """Print PyTorch/CUDA information before starting training."""
+
+    print("\nEnvironment")
+    print("-" * 60)
+    print("PyTorch:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA version:", torch.version.cuda)
+
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("GPU count:", torch.cuda.device_count())
+
+        try:
+            props = torch.cuda.get_device_properties(0)
+            print(
+                "GPU memory:",
+                round(props.total_memory / (1024 ** 3), 2),
+                "GB",
+            )
+        except Exception:
+            pass
+    else:
+        print("WARNING: CUDA is not available.")
+        print(
+            "Training will run on CPU and VITS training may be extremely slow."
+        )
+
+    print("-" * 60)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data/akan_ljs")
-    ap.add_argument("--out", default="runs/akan_vits")
-    ap.add_argument("--epochs", type=int, default=300)
-    ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--no_pretrained", action="store_true", help="train from scratch")
-    ap.add_argument("--continue_path", default="", help="existing training folder to resume")
-    ap.add_argument("--fp32", action="store_true", help="disable mixed precision if loss goes NaN")
-    ap.add_argument("--seed", type=int, default=1234)
+
+    ap.add_argument(
+        "--data",
+        default="data/akan_ljs",
+    )
+
+    ap.add_argument(
+        "--out",
+        default="runs/akan_vits",
+    )
+
+    ap.add_argument(
+        "--epochs",
+        type=int,
+        default=300,
+    )
+
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+    )
+
+    ap.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+    )
+
+    ap.add_argument(
+        "--no_pretrained",
+        action="store_true",
+        help="train from scratch",
+    )
+
+    ap.add_argument(
+        "--continue_path",
+        default="",
+        help="existing training folder to resume",
+    )
+
+    ap.add_argument(
+        "--fp32",
+        action="store_true",
+        help="disable mixed precision if loss goes NaN",
+    )
+
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+    )
+
     a = ap.parse_args()
+
+    # ------------------------------------------------------------------
+    # Paths
+    # ------------------------------------------------------------------
 
     data_dir = Path(a.data).resolve()
     out_dir = Path(a.out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print_environment()
+
+    # ------------------------------------------------------------------
+    # Dataset validation
+    # ------------------------------------------------------------------
+
     validate_data(data_dir)
 
+    # ------------------------------------------------------------------
+    # Reproducibility
+    # ------------------------------------------------------------------
+
     torch.manual_seed(a.seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(a.seed)
+
+    # ------------------------------------------------------------------
+    # Dataset configuration
+    # ------------------------------------------------------------------
 
     ds = BaseDatasetConfig(
         formatter="ljspeech",
@@ -83,6 +226,11 @@ def main():
         meta_file_val="metadata_val.csv",
         path=str(data_dir),
     )
+
+    # ------------------------------------------------------------------
+    # Audio configuration
+    # ------------------------------------------------------------------
+
     audio = VitsAudioConfig(
         sample_rate=22050,
         win_length=1024,
@@ -91,43 +239,72 @@ def main():
         mel_fmin=0,
         mel_fmax=None,
     )
+
+    # ------------------------------------------------------------------
+    # Akan character configuration
+    # ------------------------------------------------------------------
+
     chars = CharactersConfig(
         characters_class="TTS.tts.models.vits.VitsCharacters",
-        pad="<PAD>", eos="<EOS>", bos="<BOS>", blank="<BLNK>",
+        pad="<PAD>",
+        eos="<EOS>",
+        bos="<BOS>",
+        blank="<BLNK>",
         characters=LETTERS,
         punctuations=" ,.?!-'\"",
         phonemes=None,
     )
+
+    # ------------------------------------------------------------------
+    # VITS configuration
+    # ------------------------------------------------------------------
+
     config = VitsConfig(
         audio=audio,
         run_name="akan_vits",
+
         batch_size=a.batch_size,
         eval_batch_size=min(8, a.batch_size),
         batch_group_size=5,
+
         num_loader_workers=4,
         num_eval_loader_workers=2,
+
         run_eval=True,
         test_delay_epochs=-1,
+
         epochs=a.epochs,
+
         text_cleaner="basic_cleaners",
         use_phonemes=False,
         compute_input_seq_cache=True,
+
         print_step=25,
         print_eval=True,
+
         mixed_precision=not a.fp32,
+
         save_step=1000,
         save_n_checkpoints=3,
         save_best_after=1000,
+
         output_path=str(out_dir),
+
         datasets=[ds],
+
         characters=chars,
+
         cudnn_benchmark=False,
+
         lr_gen=a.lr,
         lr_disc=a.lr,
+
         min_text_len=2,
         max_text_len=250,
+
         min_audio_len=22050 * 1,
         max_audio_len=22050 * 15,
+
         test_sentences=[
             "Akwaaba.",
             "Wo ho te sɛn?",
@@ -136,22 +313,88 @@ def main():
         ],
     )
 
+    # ------------------------------------------------------------------
+    # Audio processor / tokenizer
+    # ------------------------------------------------------------------
+
+    print("\nInitializing audio processor...")
+
     ap_ = AudioProcessor.init_from_config(config)
+
+    print("Initializing tokenizer...")
+
     tokenizer, config = TTSTokenizer.init_from_config(config)
-    train, val = load_tts_samples(ds, eval_split=True)
-    model = Vits(config, ap_, tokenizer, speaker_manager=None)
+
+    # ------------------------------------------------------------------
+    # Load training/validation samples
+    # ------------------------------------------------------------------
+
+    print("Loading TTS samples...")
+
+    train, val = load_tts_samples(
+        ds,
+        eval_split=True,
+    )
+
+    print(f"Training samples: {len(train)}")
+    print(f"Validation samples: {len(val)}")
+
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
+
+    print("Initializing VITS model...")
+
+    model = Vits(
+        config,
+        ap_,
+        tokenizer,
+        speaker_manager=None,
+    )
+
+    # ------------------------------------------------------------------
+    # Checkpoint / resume configuration
+    # ------------------------------------------------------------------
 
     if a.continue_path:
-        trainer_args = TrainerArgs(continue_path=a.continue_path)
-    elif a.no_pretrained:
-        trainer_args = TrainerArgs()
-    else:
-        pretrained = get_pretrained()
-        print(f"Restoring compatible weights from pretrained checkpoint: {pretrained}")
-        print("If tensor shapes differ because of the Akan character inventory, Coqui Trainer will use its partial state-dict restoration path.")
-        trainer_args = TrainerArgs(restore_path=pretrained)
 
-    # Record the experiment configuration before training.
+        print(
+            f"Resuming training from: {a.continue_path}"
+        )
+
+        trainer_args = TrainerArgs(
+            continue_path=a.continue_path
+        )
+
+    elif a.no_pretrained:
+
+        print("Training from scratch.")
+
+        trainer_args = TrainerArgs()
+
+    else:
+
+        pretrained = get_pretrained()
+
+        print(
+            f"Restoring compatible weights from pretrained checkpoint: "
+            f"{pretrained}"
+        )
+
+        print(
+            "If tensor shapes differ because of the Akan character "
+            "inventory, Coqui Trainer will use its partial state-dict "
+            "restoration path."
+        )
+
+        trainer_args = TrainerArgs(
+            restore_path=pretrained
+        )
+
+    # ------------------------------------------------------------------
+    # Save experiment configuration
+    # ------------------------------------------------------------------
+
     experiment = {
         "data": str(data_dir),
         "output": str(out_dir),
@@ -160,13 +403,42 @@ def main():
         "learning_rate": a.lr,
         "mixed_precision": not a.fp32,
         "seed": a.seed,
-        "pretrained": not a.no_pretrained and not bool(a.continue_path),
+        "pretrained": (
+            not a.no_pretrained
+            and not bool(a.continue_path)
+        ),
         "cuda": torch.cuda.is_available(),
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "gpu": (
+            torch.cuda.get_device_name(0)
+            if torch.cuda.is_available()
+            else None
+        ),
+        "pytorch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
     }
+
     (out_dir / "experiment_config.json").write_text(
-        json.dumps(experiment, indent=2), encoding="utf-8"
+        json.dumps(
+            experiment,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
+
+    # ------------------------------------------------------------------
+    # IMPORTANT:
+    # Coqui Trainer serializes its configuration using json.dump().
+    # Some versions leave pathlib.Path objects inside the config.
+    # Patch JSONEncoder so those Paths become strings.
+    # ------------------------------------------------------------------
+
+    patch_json_path_serialization()
+
+    # ------------------------------------------------------------------
+    # Trainer
+    # ------------------------------------------------------------------
+
+    print("\nInitializing Coqui Trainer...")
 
     trainer = Trainer(
         trainer_args,
@@ -176,12 +448,37 @@ def main():
         train_samples=train,
         eval_samples=val,
     )
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    print("\nStarting training...")
+    print("=" * 80)
+
     trainer.fit()
 
-    print("Training finished. Searching for checkpoints...")
-    checkpoints = sorted(out_dir.rglob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in checkpoints[:10]:
-        print(p)
+    # ------------------------------------------------------------------
+    # Find checkpoints
+    # ------------------------------------------------------------------
+
+    print("\nTraining finished.")
+    print("Searching for checkpoints...")
+
+    checkpoints = sorted(
+        out_dir.rglob("*.pth"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if checkpoints:
+        print("\nCheckpoints:")
+        for p in checkpoints[:10]:
+            print(p)
+    else:
+        print("No .pth checkpoints found.")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
