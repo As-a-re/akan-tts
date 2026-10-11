@@ -34,13 +34,45 @@ def iter_local(args):
 
 
 def iter_hf(args):
+    """Iterate HF audio rows across both legacy dict and datasets v4 AudioDecoder APIs."""
     from datasets import load_dataset, Audio
     ds = load_dataset(args.hf_dataset, args.hf_config, split=args.split)
     ds = ds.cast_column(args.audio_col, Audio(sampling_rate=SR))
     if args.speaker_col and args.speaker_id is not None:
-        ds = ds.filter(lambda ex: str(ex[args.speaker_col]) == str(args.speaker_id))
+        ds = ds.filter(lambda ex: ex.get(args.speaker_col) is not None and
+                       str(ex[args.speaker_col]) == str(args.speaker_id))
     for i, ex in enumerate(ds):
-        yield f"utt{i:06d}", np.asarray(ex[args.audio_col]["array"], dtype=np.float32), ex[args.text_col]
+        raw_text = ex.get(args.text_col)
+        # Public corpora can contain null or blank transcripts; do not pass these
+        # into normalization or pair them with audio.
+        if raw_text is None or not str(raw_text).strip():
+            continue
+        audio_obj = ex.get(args.audio_col)
+        if audio_obj is None:
+            continue
+        if isinstance(audio_obj, dict):
+            audio_array = audio_obj.get("array")
+        elif hasattr(audio_obj, "get_all_samples"):
+            decoded = audio_obj.get_all_samples()
+            audio_array = getattr(decoded, "samples", None)
+            if audio_array is None:
+                audio_array = getattr(decoded, "data", None)
+            if audio_array is None:
+                raise TypeError(f"Unsupported decoded audio object: {type(decoded)!r}")
+        else:
+            raise TypeError(f"Unsupported audio value: {type(audio_obj)!r}")
+        if audio_array is None:
+            continue
+        # AudioDecoder samples are commonly channel-first (channels, time).
+        if hasattr(audio_array, "detach"):
+            audio_array = audio_array.detach().cpu().numpy()
+        audio_array = np.asarray(audio_array, dtype=np.float32)
+        if audio_array.ndim == 2:
+            audio_array = audio_array.mean(axis=0) if audio_array.shape[0] <= 8 else audio_array.mean(axis=1)
+        audio_array = np.squeeze(audio_array)
+        if audio_array.ndim != 1 or audio_array.size == 0:
+            continue
+        yield f"utt{i:06d}", audio_array, str(raw_text)
 
 
 def clean_audio(y):
